@@ -1,82 +1,84 @@
+
 import os
 import requests
 from bs4 import BeautifulSoup
 import json
 import urllib.parse
+import threading
+import time
+from flask import Flask
 
-def get_product_details(url: str):
-    API_KEY = os.environ.get('SCRAPER_API_KEY')
-    if not API_KEY:
-        print("Error: SCRAPER_API_KEY not found.")
-        return None
-        
-    encoded_url = urllib.parse.quote(url)
-    scraperapi_url = f'http://api.scraperapi.com?api_key={API_KEY}&url={encoded_url}'
-    
-    try:
-        response = requests.get(scraperapi_url, timeout=30)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.content, "lxml")
-        
-        title_element = soup.find(id="productTitle")
-        title = title_element.get_text(strip=True) if title_element else "Product"
+# --- Flask App Setup (To keep the bot alive on Render) ---
+app = Flask(__name__)
 
-        price = None
-        price_span = soup.find("span", {"class": "a-price-whole"})
-        if price_span:
-            price_text = price_span.get_text(strip=True).replace(',', '').replace('.', '')
-            price = int(price_text)
-        else:
-            price_span_2 = soup.select_one('.a-price .a-offscreen')
-            if price_span_2:
-                price_text = ''.join(filter(str.isdigit, price_span_2.get_text()))
-                price = int(price_text[:-2]) if len(price_text) > 2 else int(price_text)
-        
-        return {"title": title, "price": price}
-        
-    except requests.exceptions.RequestException as e:
-        print(f"Error calling ScraperAPI for {url}: {e}")
-        return None
+@app.route('/')
+def home():
+    # This page will be pinged by UptimeRobot
+    return "I am alive!", 200
 
-def handle_telegram_webhook(request):
+def run_flask_app():
+    app.run(host='0.0.0.0', port=8080)
+
+# --- Main Bot Logic (Remains mostly the same) ---
+
+def send_telegram_message(chat_id, text):
     TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
     if not TELEGRAM_TOKEN:
-        return "Telegram Token not set.", 500
+        print("Telegram Token not set.")
+        return
 
-    # Extract the message data from Telegram's request
-    update = request.get_json()
-    
+    send_message_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "Markdown"
+    }
+    try:
+        requests.post(send_message_url, json=payload)
+    except Exception as e:
+        print(f"Error sending message to {chat_id}: {e}")
+        
+# This is a simplified function to demonstrate the logic. 
+# For a real bot, you'll expand this with more commands.
+def handle_update(update):
     if "message" not in update:
-        return "OK", 200
+        return
 
     chat_id = update["message"]["chat"]["id"]
     message_text = update["message"]["text"]
     
-    # This is where the main logic of your bot goes
     if message_text == "/start":
-        reply_text = "Welcome! Send me an Amazon link to get its price."
-    elif "amazon" in message_text or "amzn" in message_text:
-        details = get_product_details(message_text)
-        if details and details.get("price"):
-            title, price = details["title"], details["price"]
-            reply_text = (
-                f"✅ **Product Found!**\n\n"
-                f"**Product:** `{title}`\n"
-                f"**Current Price:** `₹{price}`"
-            )
-        else:
-            reply_text = "❌ Sorry, I could not fetch the product details."
+        reply_text = "Welcome! Send me a link to get started."
+        send_telegram_message(chat_id, reply_text)
     else:
-        reply_text = "Please send a valid Amazon link."
+        # You would add your price tracking logic here
+        reply_text = f"You sent: {message_text}"
+        send_telegram_message(chat_id, reply_text)
+        
+def poll_telegram_updates():
+    TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
+    offset = 0
+    print("Bot polling started...")
+    while True:
+        try:
+            poll_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates?offset={offset}&timeout=100"
+            response = requests.get(poll_url, timeout=120)
+            updates = response.json().get("result", [])
+            
+            if updates:
+                for update in updates:
+                    handle_update(update)
+                    offset = update["update_id"] + 1
+            
+            time.sleep(1)
+        except Exception as e:
+            print(f"Error in polling: {e}")
+            time.sleep(10)
 
-    # Send the reply back to the user
-    send_message_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": reply_text,
-        "parse_mode": "Markdown"
-    }
-    requests.post(send_message_url, json=payload)
+if __name__ == "__main__":
+    # Start the Flask app in a separate thread
+    flask_thread = threading.Thread(target=run_flask_app)
+    flask_thread.start()
     
-    # Tell Telegram "I got the message, thank you"
-    return "OK", 200
+    # Start the Telegram bot polling in the main thread
+    poll_telegram_updates()
